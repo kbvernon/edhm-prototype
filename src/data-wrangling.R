@@ -82,7 +82,7 @@ service <- file.path(
 # api wants triplets of the form stationId:stateCode:networkCode
 # '*' wildcard also allowed
 targets <- sprintf(
-  "*:%1s:SCAN, *:%1s:SNTL",
+  "*:%s:SCAN,*:%s:SNTL",
   c("AZ", "CA", "CO", "ID", "MT", "NV", "NM", "OR", "UT", "WA", "WY"),
   c("AZ", "CA", "CO", "ID", "MT", "NV", "NM", "OR", "UT", "WA", "WY")
 ) |> paste(collapse = ",")
