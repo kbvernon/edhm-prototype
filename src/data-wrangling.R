@@ -138,4 +138,6 @@ write_sf(
   layer = "sm-station-metadata"
 )
 
+remove(service, targets, path, uscrn)
+
 # soil moisture station data ---------------------------------------------
