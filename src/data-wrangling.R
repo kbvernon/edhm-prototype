@@ -71,7 +71,7 @@ write_sf(
 
 remove(service, states, targets)
 
-# soil moisture station metadata -----------------------------------------
+# stations ---------------------------------------------------------------
 
 # primary key = id:state:network
 
@@ -79,14 +79,8 @@ remove(service, states, targets)
 # moisture data
 stations <- western_us |>
   st_geometry() |>
-  get_station_metadata(elements = "SMS:*") |>
-  rename(
-    "id" = station_id,
-    "state" = state_code,
-    "network" = network_code
-  ) |>
-  select(station_triplet, id, state, network, name) |>
-  st_transform(epsg)
+  get_stations(elements = "SMS:*") |>
+  select(station_triplet, name)
 
 # TODO: get USCRN data
 
@@ -131,26 +125,36 @@ write_sf(
 
 # remove(path, uscrn)
 
-# soil moisture station data ---------------------------------------------
+# soil moisture ----------------------------------------------------------
 
 # SMS:* - soil moisture percent, all depths
-station_data <- western_us |>
-  get_station_data(
+soil_data <- western_us |>
+  get_elements(
     elements = "SMS:*",
-    begin_date = time_frame[["start"]],
-    end_date = time_frame[["end"]],
-    request_size = 35L
+    awdb_options = set_options(
+      begin_date = time_frame[["start"]],
+      end_date = time_frame[["end"]],
+      request_size = 35L
+    )
   ) |>
-  select(station_triplet:duration_name, values) |>
-  unnest(values)
+  unnest(element_values) |>
+  select(station_triplet, height_depth, date, value) |>
+  mutate(id = row_number()) |>
+  pivot_wider(
+    id_cols = c(id, station_triplet, date),
+    names_from = height_depth,
+    values_from = value
+  ) |>
+  select(-id) |>
+  rename_with(gsub, pattern = "-", replacement = "sm_")
 
 write_sf(
-  station_data,
+  soil_data,
   dsn = gpkg,
   layer = "soil"
 )
 
-remove(station_data)
+remove(soil_data)
 
 # elevation and terrain --------------------------------------------------
 
@@ -215,7 +219,7 @@ terrain_data <- cbind(
   terrain_data
 )
 
-terrain_data <- as.data.frame(terrain_data)
+terrain_data <- as_tibble(terrain_data)
 
 write_sf(
   terrain_data,
@@ -233,7 +237,13 @@ service <- file.path(
   "data"
 )
 
-variables <- c("pr", "srad", "tmmn", "tmmx")
+# pr   = precipitation
+# sph  = specific humidity
+# srad = solar radiation
+# tmmn = temperature minimum
+# tmmx = temperature maximum
+# vs   = wind speed
+variables <- c("pr", "sph", "srad", "tmmn", "tmmx", "vs")
 
 years <- 2010:2020
 
@@ -242,10 +252,12 @@ features <- stations |>
   vect() |>
   project("epsg:4326")
 
-gridmet_data <- vector(mode = "list", length = length(variables))
+climate_data <- vector(mode = "list", length = length(variables))
 
-# takes nearly 40 minutes on my machine
+# each variable takes ~15-20 minutes to process
 for (i in seq_along(variables)) {
+  start <- Sys.time()
+
   layers <- file.path(
     service,
     paste0(variables[i], "_", years, ".nc")
@@ -258,42 +270,207 @@ for (i in seq_along(variables)) {
 
   # transpose and unfold M to get long vector with
   # all dates for each station as contiguous elements
-  gridmet_data[[i]] <- c(t(M))
+  climate_data[[i]] <- c(t(M))
 
-  cat("Data for", variables[i], "variable successfuly extracted.\n")
+  end <- Sys.time()
 
-  remove(i, layers, r, M)
+  sprintf(
+    "Successfully downloaded: %s. Total elapsed time: %s minutes.\n",
+    variables[i],
+    round(difftime(end, start, units = "mins"), 2)
+  ) |> cat()
+
+  remove(i, start, layers, r, M, end)
 }
 
-gridmet_data <- do.call(cbind, gridmet_data)
-gridmet_data <- as.data.frame(gridmet_data)
+climate_data <- do.call(cbind, climate_data)
+climate_data <- as_tibble(climate_data)
 
-names(gridmet_data) <- c(
+names(climate_data) <- c(
   "precipitation",
+  "humidity",
   "radiation",
   "temperature_min",
-  "temperature_max"
+  "temperature_max",
+  "wind_speed"
 )
 
 dates <- seq(as.Date("2010-01-01"), as.Date("2020-12-31"), by = 1)
 
 keys <- data.frame(
   station_triplet = rep(stations[["station_triplet"]], each = length(dates)),
-  date = rep(dates, each = nrow(stations))
+  date = rep(dates, nrow(stations))
 )
 
-gridmet_data <- cbind(keys, gridmet_data)
+climate_data <- cbind(keys, climate_data)
 
 # subset to time period of interest
-i <- which(gridmet_data[["date"]] >= as.Date(time_frame[["start"]]))
+i <- which(climate_data[["date"]] >= as.Date(time_frame[["start"]]))
 
-gridmet_data <- gridmet_data[i, ]
-gridmet_data[["date"]] <- as.character(gridmet_data[["date"]])
+climate_data <- climate_data[i, ]
+climate_data[["date"]] <- as.character(climate_data[["date"]])
 
 write_sf(
-  gridmet_data,
+  climate_data,
   dsn = gpkg,
   layer = "climate"
 )
 
-remove(service, variables, years, features, dates, keys, i, gridmet_data)
+remove(service, variables, years, features, dates, keys, i, climate_data)
+
+# land cover -------------------------------------------------------------
+
+service <- "https://s3-us-west-2.amazonaws.com/mrlc"
+
+years <- 2010:2020
+
+layers <- paste0(service, "/Annual_NLCD_LndCov_", years, "_CU_C1V0.tif")
+
+# degenerate crs
+target_crs <- crs(rast(layers[1], vsi = TRUE))
+
+aoi <- western_us |>
+  st_transform(target_crs) |>
+  vect() |>
+  ext()
+
+virtual_raster <- rast(layers, vsi = TRUE, win = aoi)
+
+names(virtual_raster) <- years
+
+features <- stations |>
+  st_transform(target_crs) |>
+  st_buffer(units::set_units(4000, m)) |>
+  vect()
+
+Mode <- function(x) {
+  tbl <- table(x, useNA = "no")
+  as.integer(names(tbl)[which.max(tbl)])
+}
+
+land_data <- terra::extract(
+  virtual_raster,
+  features,
+  fun = Mode,
+  ID = FALSE
+)
+
+land_data <- land_data |>
+  mutate(station_triplet = stations[["station_triplet"]], .before = everything()) |>
+  pivot_longer(
+    -station_triplet,
+    names_to = "year",
+    values_to = "land_cover"
+  ) |>
+  mutate(
+    year = as.integer(year),
+    land_cover = case_match(
+      land_cover,
+      11 ~ 1L,
+      12 ~ 2L,
+      21 ~ 3L,
+      22 ~ 4L,
+      23 ~ 5L,
+      24 ~ 6L,
+      31 ~ 7L,
+      41 ~ 8L,
+      42 ~ 9L,
+      43 ~ 10L,
+      52 ~ 11L,
+      71 ~ 12L,
+      81 ~ 13L,
+      82 ~ 14L,
+      90 ~ 15L,
+      95 ~ 16L,
+      .default = NA_integer_
+    )
+  )
+
+land_cover_lookup <- data.frame(
+  nlcd_id = as.integer(c(1:16, NA_integer_)),
+  id = c(11, 12, 21, 22, 23, 24, 31, 41, 42, 43, 52, 71, 81, 82, 90, 95, 250),
+  name = c(
+    "Open Water",
+    "Perennial Ice/Snow",
+    "Developed, Open Space",
+    "Developed, Low Intensity",
+    "Developed, Medium Intensity",
+    "Developed, High Intensity",
+    "Barren Land (Rock/Sand/Clay)",
+    "Deciduous Forest",
+    "Evergreen Forest",
+    "Mixed Forest",
+    "Shrub/Scrub",
+    "Grassland/Herbaceous",
+    "Pasture/Hay",
+    "Cultivated Crops",
+    "Woody Wetlands",
+    "Emergent Herbaceous Wetlands",
+    "No Data"
+  )
+)
+
+write_sf(
+  land_cover_lookup,
+  dsn = gpkg,
+  layer = "land_cover_lookup"
+)
+
+write_sf(
+  land_data,
+  dsn = gpkg,
+  layer = "land"
+)
+
+remove(
+  service, years, layers, target_crs, aoi, virtual_raster,
+  features, Mode, land_data, land_cover_lookup
+)
+
+# table ------------------------------------------------------------------
+
+coordinates <- stations |>
+  st_coordinates() |>
+  as_tibble() |>
+  rename_with(tolower) |>
+  mutate(
+    station_triplet = stations[["station_triplet"]],
+    .before = everything()
+  )
+
+soil_data <- read_sf(gpkg, "soil")
+terrain_data <- read_sf(gpkg, "terrain")
+climate_data <- read_sf(gpkg, "climate")
+land_data <- read_sf(gpkg, "land")
+
+all_data <- soil_data |>
+  left_join(coordinates, by = "station_triplet") |>
+  full_join(
+    climate_data |> filter(station_triplet %in% soil_data[["station_triplet"]]),
+    by = c("station_triplet", "date")
+  ) |>
+  select(where(\(x) sum(!is.na(x)) / length(x) >= 0.25)) |>
+  filter(!is.na(sm_8)) |>
+  left_join(terrain_data, by = "station_triplet") |>
+  mutate(year = as.integer(strsplit(date, "-")[[1]][1])) |>
+  left_join(land_data, by = c("station_triplet", "year")) |>
+  select(
+    station_triplet,
+    date,
+    x, y,
+    sm_8,
+    precipitation,
+    humidity,
+    radiation,
+    temperature_min,
+    temperature_max,
+    wind_speed,
+    elevation,
+    tri_rmsd,
+    tpi,
+    p_flat,
+    land_cover
+  ) |>
+  filter(!is.na(sm_8))
+
+all_data |> readr::write_csv("data/edhm-prototype-data.csv")
