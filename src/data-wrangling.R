@@ -316,7 +316,7 @@ write_sf(
   layer = "climate"
 )
 
-remove(service, variables, years, features, dates, keys, i, climate_data)
+remove(service, variables, years, features, dates, keys, climate_data)
 
 # land cover -------------------------------------------------------------
 
@@ -356,7 +356,10 @@ land_data <- terra::extract(
 )
 
 land_data <- land_data |>
-  mutate(station_triplet = stations[["station_triplet"]], .before = everything()) |>
+  mutate(
+    station_triplet = stations[["station_triplet"]],
+    .before = everything()
+  ) |>
   pivot_longer(
     -station_triplet,
     names_to = "year",
@@ -387,8 +390,11 @@ land_data <- land_data |>
   )
 
 land_cover_lookup <- data.frame(
-  nlcd_id = as.integer(c(1:16, NA_integer_)),
-  id = c(11, 12, 21, 22, 23, 24, 31, 41, 42, 43, 52, 71, 81, 82, 90, 95, 250),
+  id = as.integer(c(1:16, NA_integer_)),
+  nlcd_id = c(
+    11, 12, 21, 22, 23, 24, 31, 41,
+    42, 43, 52, 71, 81, 82, 90, 95, 250
+  ),
   name = c(
     "Open Water",
     "Perennial Ice/Snow",
